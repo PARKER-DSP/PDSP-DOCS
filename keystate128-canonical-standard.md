@@ -1,0 +1,232 @@
+---
+title: KeyState128 v1 Canonical Standard
+audience: [core, dev, docs]
+status: draft
+last_reviewed: 2026-02-20
+---
+
+# KeyState128 v1 Canonical Standard
+
+This document standardizes **one canonical bit ordering** and **one canonical serialization** for `keystate128` so the web demo, core engine, and future plugin shells interpret it identically.
+
+---
+
+## Definitions
+
+- **MIDI note number**: integer `n` in `[0..127]`
+- **keystate128**: 128 boolean flags (0/1) that represent whether a MIDI note is active.
+- **KeyState128 (canonical runtime form)**: exactly **16 bytes** = 128 bits.
+
+---
+
+## 1) Canonical in-memory representation
+
+**Type:** exactly **16 bytes** = 128 bits
+
+- JS/TS: `Uint8Array` length **16**
+- C++: `std::array<std::uint8_t, 16>`
+
+**Invariant:** the array length MUST be 16 bytes.
+
+---
+
+## 2) Canonical bit ordering (note → byte/bit mapping)
+
+### Normative rule
+
+For MIDI note number `n` in `[0..127]`:
+
+- `byteIndex = n >> 3`  (equivalent to `floor(n / 8)`)
+- `bitIndex  = n & 7`   (equivalent to `n % 8`)
+- **bitIndex 0 is the least-significant bit (LSB)** of the byte
+
+### Meaning
+
+- If the bit is `1` → note `n` is active
+- If the bit is `0` → note `n` is inactive
+
+### Set / clear / test (definition)
+
+- **Set on:** `bytes[byteIndex] |= (1 << bitIndex)`
+- **Set off:** `bytes[byteIndex] &= ~(1 << bitIndex)`
+- **Test:** `((bytes[byteIndex] >> bitIndex) & 1)`
+
+**Important:** Do not treat this as a platform “128-bit integer”. The canonical form is **bytes + bit positions**. Platform endianness must not affect interpretation.
+
+---
+
+## 3) Canonical serialization (wire format)
+
+### One canonical serialization: base64url (no padding) of the 16 bytes
+
+- Input: the 16-byte array (in canonical note order described above)
+- Output: **base64url string** (RFC 4648 URL-safe alphabet `A–Z a–z 0–9 - _`)
+- Padding: **MUST be removed** (strip `=`)
+- Length: for 16 bytes, base64url-no-pad is **always 22 characters**
+
+### Decode rules
+
+- Decode the base64url string into bytes.
+- The decoded byte array MUST be **exactly 16 bytes**.
+- If decoded length ≠ 16 → reject as invalid.
+
+This ensures:
+- identical behavior in web + core + plugins
+- stable URL/share state
+- deterministic snapshots
+
+---
+
+# Reference implementations
+
+## TypeScript / JavaScript
+
+```ts
+export type KeyState128 = Uint8Array; // MUST be length 16
+
+export function makeEmptyKeyState128(): KeyState128 {
+  return new Uint8Array(16);
+}
+
+export function setKeyOn(state: KeyState128, note: number): void {
+  const byteIndex = note >> 3;
+  const bitIndex = note & 7;
+  state[byteIndex] |= 1 << bitIndex;
+}
+
+export function setKeyOff(state: KeyState128, note: number): void {
+  const byteIndex = note >> 3;
+  const bitIndex = note & 7;
+  state[byteIndex] &= ~(1 << bitIndex);
+}
+
+export function isKeyOn(state: KeyState128, note: number): boolean {
+  const byteIndex = note >> 3;
+  const bitIndex = note & 7;
+  return ((state[byteIndex] >> bitIndex) & 1) === 1;
+}
+
+// --- Canonical serialization: base64url (no padding) ---
+
+function toBase64Url(bytes: Uint8Array): string {
+  // Browser-safe base64 for bytes
+  let bin = "";
+  for (let i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
+  const b64 = btoa(bin);
+  return b64.replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
+}
+
+function fromBase64Url(s: string): Uint8Array {
+  // Add padding back if needed (base64 requires length multiple of 4)
+  const padded = s.replace(/-/g, "+").replace(/_/g, "/") + "===".slice((s.length + 3) % 4);
+  const bin = atob(padded);
+  const out = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+  return out;
+}
+
+export function encodeKeyState128(state: KeyState128): string {
+  if (state.length !== 16) throw new Error("KeyState128 must be 16 bytes");
+  return toBase64Url(state);
+}
+
+export function decodeKeyState128(encoded: string): KeyState128 {
+  const bytes = fromBase64Url(encoded);
+  if (bytes.length !== 16) throw new Error("Invalid KeyState128 encoding (must decode to 16 bytes)");
+  return bytes;
+}
+```
+
+> Node note: in Node you can simplify base64 using `Buffer.from(bytes).toString("base64")`, then convert to base64url and strip padding.
+
+---
+
+## C++
+
+```cpp
+#include <array>
+#include <cstdint>
+
+using KeyState128 = std::array<std::uint8_t, 16>;
+
+inline void setKeyOn(KeyState128& ks, int note) {
+  const int byteIndex = note >> 3;
+  const int bitIndex  = note & 7;
+  ks[byteIndex] |= static_cast<std::uint8_t>(1u << bitIndex);
+}
+
+inline void setKeyOff(KeyState128& ks, int note) {
+  const int byteIndex = note >> 3;
+  const int bitIndex  = note & 7;
+  ks[byteIndex] &= static_cast<std::uint8_t>(~(1u << bitIndex));
+}
+
+inline bool isKeyOn(const KeyState128& ks, int note) {
+  const int byteIndex = note >> 3;
+  const int bitIndex  = note & 7;
+  return ((ks[byteIndex] >> bitIndex) & 1u) == 1u;
+}
+```
+
+For serialization in C++: implement (or reuse) **base64url no-pad** over 16 bytes. Requirements:
+- input bytes are in canonical order
+- output uses `- _` and no `=`
+- decode must produce exactly 16 bytes
+
+---
+
+# Test vector (sanity check)
+
+## Example: C major triad (notes 60, 64, 67)
+
+Using the canonical bit order:
+
+- note 60 → byte `7`, bit `4` → `bytes[7] = 0x10`
+- note 64 → byte `8`, bit `0`
+- note 67 → byte `8`, bit `3` → `bytes[8] = 0x09` (0x01 + 0x08)
+
+So the full 16-byte payload in hex is:
+
+```text
+00000000000000100900000000000000
+```
+
+Canonical base64url (no padding) encoding of those 16 bytes:
+
+```text
+AAAAAAAAABAJAAAAAAAAAA
+```
+
+If any layer generates a different byte string or a different 22-character base64url string for that chord, it is not following this standard.
+
+---
+
+# How to use this across the stack
+
+## Web demo
+
+- Component prop: `keystate128: Uint8Array` (length 16)
+- URL/share state: store `encodeKeyState128(keystate128)` as a 22-char string
+
+## Core engine
+
+- Store `KeyState128` as 16 bytes
+- All transformations (add/remove notes, operators) use the same bit mapping
+- Serialization for presets/links: same base64url-no-pad function
+
+## Plugin shells (JUCE)
+
+- Convert host MIDI events into `KeyState128` by setting/clearing bits
+- When pushing state to UI/editor, send the same 16 bytes or the same base64url string
+- Never reinterpret as a 128-bit integer with platform endianness assumptions
+
+---
+
+# Non-negotiable policy
+
+**Every boundary that crosses “system lines” should use the canonical serialization.**
+
+- UI ↔ core: pass the 16 bytes directly *or* pass the base64url string (pick one and keep it consistent)
+- URLs / presets / files: always base64url-no-pad of the 16 bytes
+
+This prevents drift and guarantees identical interpretation everywhere.
